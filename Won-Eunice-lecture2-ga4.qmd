@@ -1,0 +1,303 @@
+---
+title: "Lecture 2 - Intermediate / Advanced BigQuery for GA4"
+author: "Eunice Won"
+date: "February 25, 2026"
+format: 
+  html: 
+    toc: true
+    number-sections: false
+    code-link: true
+    embed-resources: true
+editor: visual
+execute: 
+  freeze: auto
+---
+
+## Lecture 2 - Intermediate / Advanced BigQuery for GA4
+
+### 1. CTES (WITH) to structure logic
+
+What it does: creates named "mini tables" inside a query.
+
+#### Total users + new users
+
+``` sql
+WITH UserInfo AS (
+SELECT
+user_pseudo_id,
+MAX(IF(event_name IN ('first_visit', 'first_open'), 1, 0)) AS is_new_user
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201101' AND '20201130'
+GROUP BY user_pseudo_id
+)
+SELECT
+COUNT(*) AS total_users,
+SUM(is_new_user) AS new_users
+FROM UserInfo;
+```
+
+![](images/clipboard-1101720633.png)
+
+CTEs help organize queries into steps. They act like temporary tables inside the query. This makes complex logic easier to read and understand.
+
+### 2. Arrays + UNNEST (the GA4 superpower)
+
+GA4 stores lots of fields inside arrays:
+
+-   event_params (key/value pairs)
+
+-   items (products in commerce events)
+
+Two common patterns:
+
+#### Pattern A - Scalar subquery extraction (simple, safe)
+
+Pull one parameter from event_params without exploding rows
+
+``` sql
+SELECT
+TIMESTAMP_MICROS(event_timestamp) AS event_time,
+(
+SELECT value.string_value
+FROM UNNEST(event_params)
+WHERE key = 'page_location' LIMIT 1
+) AS page_location
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE event_name = 'page_view'
+AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201202'
+LIMIT 50;
+```
+
+![](images/clipboard-787849997.png)
+
+![](images/clipboard-2668558564.png)
+
+#### Pattern B - Flattening (UNNEST in FROM) for item-level analysis
+
+This multiples rows (one event can have many items)
+
+``` sql
+SELECT
+event_date,
+item.item_name,
+COUNT(*) AS item_rows
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` e,
+UNNEST(e.items) AS item
+WHERE e.event_name = 'purchase'
+AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_date, item.item_name
+ORDER BY item_rows DESC
+LIMIT 20;
+```
+
+![](images/clipboard-2672868977.png)
+
+::: callout-note
+UNNEST changes the "grain". After unnesting items, you're no longer at "event-level"; you're at "item-row per event".
+:::
+
+GA4 stores data inside arrays like `event_params` and `items`. If we use UNNEST, it multiplies rows and changes the data level. This is very important to understand.
+
+### 3. STRING_AGG, ARRAY_AGG (useful aggregations)
+
+What they do: combine many values into one row per group.
+
+Example: show a few event_names seen per day
+
+``` sql
+SELECT
+event_date,
+STRING_AGG(DISTINCT event_name, ', ' ORDER BY event_name) AS events_seen
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201203'
+GROUP BY event_date
+ORDER BY event_date
+```
+
+![](images/clipboard-2096844741.png)
+
+Example: Build a "session cart summary" (top items a user added to cart)
+
+##### Use Case 1:
+
+Task: Create a list of items per session
+
+``` sql
+SELECT
+    user_pseudo_id,
+    ARRAY_AGG(item_name) AS items_added_to_cart
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+UNNEST(items) AS item
+WHERE event_name = 'add_to_cart'
+AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY user_pseudo_id
+ORDER BY user_pseudo_id
+LIMIT 10;
+```
+
+![](images/clipboard-3499402040.png)
+
+##### Use Case 2:
+
+Session-level "cart summary" using ARRAY_AGG
+
+``` sql
+WITH add_to_cart AS (
+  SELECT
+    user_pseudo_id,
+    (
+      SELECT value.int_value 
+      FROM UNNEST(event_params) 
+      WHERE key = 'ga_session_id'
+    ) AS session_id,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+    i.item_id,
+    i.item_name,
+    i.quantity,
+    i.price
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+  UNNEST(items) AS i
+  WHERE event_name = 'add_to_cart'
+    AND _TABLE_SUFFIX BETWEEN '20210101' AND '20211231'  -- cost control
+)
+SELECT
+  user_pseudo_id,
+  session_id,
+  COUNT(*) AS total_add_to_cart_events,              -- added insight
+  ARRAY_AGG(
+    STRUCT(item_id, item_name, quantity, price, event_timestamp)
+    ORDER BY quantity DESC, event_timestamp ASC
+    LIMIT 10
+  ) AS cart_items
+FROM add_to_cart
+WHERE session_id IS NOT NULL                          --  filter nulls
+GROUP BY user_pseudo_id, session_id;
+```
+
+![](images/clipboard-3653159183.png)
+
+These functions combine multiple values into one row. They help summarize data and make it easier to read.
+
+### 4. Joins (start with INNER and LEFT)
+
+What it does: combines results based on matching keys
+
+Example: daily users joined with daily purchases (using CTES)
+
+``` sql
+WITH daily_users AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT user_pseudo_id) AS users
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+),
+daily_purchases AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT
+      (SELECT value.string_value
+       FROM UNNEST(event_params)
+       WHERE key = 'transaction_id')
+    ) AS purchases    -- distinct transactions
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE event_name = 'purchase'
+    AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+)
+SELECT
+  u.event_date,
+  u.users,
+  -- turns “no purchase row (NULL)” into 0 purchases, which is what you want for a daily time series
+  IFNULL(p.purchases, 0) AS purchases,              
+  -- Conversion rate: what % of daily users made a purchase
+  ROUND(
+    IFNULL(p.purchases, 0) / NULLIF(u.users, 0) * 100, 2
+  ) AS conversion_rate_pct        -- NULLIF prevents division by zero
+FROM daily_users u
+LEFT JOIN daily_purchases p
+  ON u.event_date = p.event_date
+ORDER BY u.event_date;
+```
+
+![](images/clipboard-154488400.png)
+
+Joins combine different summaries together. For example, we joined daily users and purchases to calculate conversion rate.
+
+### 5. Window functions + QUALIFY
+
+What they do: calculate "across rows" without collapsing to one row per group
+
+Top 3 event types per day (RANK) + QUALIFY
+
+``` sql
+WITH daily_event_counts AS (
+SELECT
+event_date,
+event_name,
+COUNT(*) AS events
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201207'
+GROUP BY event_date, event_name
+)
+SELECT
+event_date,
+event_name,
+events,
+RANK() OVER (PARTITION BY event_date ORDER BY events DESC) AS rnk
+FROM daily_event_counts
+QUALIFY rnk <= 3 
+ORDER BY event_date, rnk;
+```
+
+![](images/clipboard-4013915163.png)
+
+Rolling 7-day average of daily purchases
+
+``` sql
+WITH daily_purchases AS (
+SELECT
+PARSE_DATE('%Y%m%d', event_date) AS dt,
+COUNT(*) AS purchases
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE event_name = 'purchase'
+AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231' GROUP BY dt
+)
+SELECT
+dt,
+purchases,
+AVG(purchases) OVER (
+ORDER BY dt
+ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+) AS purchases_7d_avg
+FROM daily_purchases
+ORDER BY dt;
+```
+
+![](images/clipboard-3546234874.png)
+
+Window functions calculate across rows without grouping everything. We used them to rank events and calculate rolling averages.
+
+### 6. Approximate functions (performance-minded)
+
+What they do: return "close enough" answers faster on huge datasets
+
+Approx distinct users per event type
+
+``` sql
+SELECT
+event_name,
+APPROX_COUNT_DISTINCT(user_pseudo_id) AS approx_users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_name
+ORDER BY approx_users DESC
+LIMIT 15;
+```
+
+### ![](images/clipboard-1002855148.png)
+
+APPROX_COUNT_DISTINCT gives a fast estimate of unique users. It is useful for large datasets.
+
+### 
